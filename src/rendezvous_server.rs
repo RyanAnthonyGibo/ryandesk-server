@@ -82,6 +82,8 @@ struct Inner {
 #[derive(Clone)]
 pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    // RyanDesk server: links persistentes (TCP/WebSocket) dos aparelhos registrados sem UDP.
+    peer_links: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -129,6 +131,7 @@ impl RendezvousServer {
         };
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
+            peer_links: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -313,42 +316,17 @@ impl RendezvousServer {
         }
     }
 
-    #[inline]
-    async fn handle_udp(
-        &mut self,
-        bytes: &BytesMut,
-        addr: SocketAddr,
-        socket: &mut FramedSocket,
-        key: &str,
-    ) -> ResultType<()> {
-        if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
-            match msg_in.union {
-                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
-                    // B registered
-                    if !rp.id.is_empty() {
-                        log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
-                        self.update_addr(rp.id, addr, socket).await?;
-                        if self.inner.serial > rp.serial {
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_configure_update(ConfigUpdate {
-                                serial: self.inner.serial,
-                                rendezvous_servers: (*self.rendezvous_servers).clone(),
-                                ..Default::default()
-                            });
-                            socket.send(&msg_out, addr).await?;
-                        }
-                    }
-                }
-                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+    /// Registro da chave do aparelho (comum a UDP e TCP/WebSocket).
+    async fn register_pk(&mut self, rk: RegisterPk, addr: SocketAddr) -> ResultType<Option<RendezvousMessage>> {
                     if rk.uuid.is_empty() || rk.pk.is_empty() {
-                        return Ok(());
+                        return Ok(None);
                     }
                     let id = rk.id;
                     let ip = addr.ip().to_string();
                     if id.len() < 6 {
-                        return send_rk_res(socket, addr, UUID_MISMATCH).await;
+                        return Ok(Some(rk_res(UUID_MISMATCH)));
                     } else if !self.check_ip_blocker(&ip, &id).await {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
+                        return Ok(Some(rk_res(TOO_FREQUENT)));
                     }
                     let peer = self.pm.get_or(&id).await;
                     let (changed, ip_changed) = {
@@ -367,7 +345,7 @@ impl RendezvousServer {
                                         peer.pk,
                                     );
                                     drop(peer);
-                                    return send_rk_res(socket, addr, UUID_MISMATCH).await;
+                                    return Ok(Some(rk_res(UUID_MISMATCH)));
                                 }
                             } else {
                                 log::warn!(
@@ -377,7 +355,7 @@ impl RendezvousServer {
                                     peer.uuid
                                 );
                                 drop(peer);
-                                return send_rk_res(socket, addr, UUID_MISMATCH).await;
+                                return Ok(Some(rk_res(UUID_MISMATCH)));
                             }
                             let ip_changed = peer.info.ip != ip;
                             (
@@ -390,7 +368,7 @@ impl RendezvousServer {
                     if req_pk.1.elapsed().as_secs() > 6 {
                         req_pk.0 = 0;
                     } else if req_pk.0 > 2 {
-                        return send_rk_res(socket, addr, TOO_FREQUENT).await;
+                        return Ok(Some(rk_res(TOO_FREQUENT)));
                     }
                     req_pk.0 += 1;
                     req_pk.1 = Instant::now();
@@ -422,7 +400,39 @@ impl RendezvousServer {
                         result: register_pk_response::Result::OK.into(),
                         ..Default::default()
                     });
-                    socket.send(&msg_out, addr).await?
+        Ok(Some(msg_out))
+    }
+
+    #[inline]
+    async fn handle_udp(
+        &mut self,
+        bytes: &BytesMut,
+        addr: SocketAddr,
+        socket: &mut FramedSocket,
+        key: &str,
+    ) -> ResultType<()> {
+        if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
+            match msg_in.union {
+                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                    // B registered
+                    if !rp.id.is_empty() {
+                        log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
+                        self.update_addr(rp.id, addr, socket).await?;
+                        if self.inner.serial > rp.serial {
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_configure_update(ConfigUpdate {
+                                serial: self.inner.serial,
+                                rendezvous_servers: (*self.rendezvous_servers).clone(),
+                                ..Default::default()
+                            });
+                            socket.send(&msg_out, addr).await?;
+                        }
+                    }
+                }
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    if let Some(msg_out) = self.register_pk(rk, addr).await? {
+                        socket.send(&msg_out, addr).await?
+                    }
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // UDP PunchHoleRequest is intentionally unsupported.
@@ -500,7 +510,7 @@ impl RendezvousServer {
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
                         let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        self.send_to_peer(msg_out, peer_addr).await;
                     }
                     return true;
                 }
@@ -545,14 +555,41 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
-                    let mut msg_out = RendezvousMessage::new();
-                    msg_out.set_register_pk_response(RegisterPkResponse {
-                        result: res.into(),
-                        ..Default::default()
-                    });
-                    Self::send_to_sink(sink, msg_out).await;
+                Some(rendezvous_message::Union::RegisterPeer(rp)) => {
+                    // RyanDesk server: registro pelo link TCP/WebSocket; o link fica guardado
+                    // para o servidor mandar PunchHole/RequestRelay ao aparelho.
+                    if rp.id.is_empty() {
+                        return true;
+                    }
+                    if let Some(sk) = sink.take() {
+                        self.peer_links.lock().await.insert(addr, sk);
+                    }
+                    let msg_out = self.update_addr_msg(rp.id, addr).await;
+                    self.send_link(addr, msg_out).await;
+                    if self.inner.serial > rp.serial {
+                        let mut cu = RendezvousMessage::new();
+                        cu.set_configure_update(ConfigUpdate {
+                            serial: self.inner.serial,
+                            rendezvous_servers: (*self.rendezvous_servers).clone(),
+                            ..Default::default()
+                        });
+                        self.send_link(addr, cu).await;
+                    }
+                    return true;
+                }
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    match self.register_pk(rk, addr).await {
+                        Ok(Some(msg_out)) => {
+                            if sink.is_some() {
+                                Self::send_to_sink(sink, msg_out).await;
+                            } else {
+                                self.send_link(addr, msg_out).await;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => log::error!("register_pk tcp: {}", err),
+                    }
+                    return true;
                 }
                 _ => {}
             }
@@ -567,6 +604,11 @@ impl RendezvousServer {
         socket_addr: SocketAddr,
         socket: &mut FramedSocket,
     ) -> ResultType<()> {
+        let msg_out = self.update_addr_msg(id, socket_addr).await;
+        socket.send(&msg_out, socket_addr).await
+    }
+
+    async fn update_addr_msg(&mut self, id: String, socket_addr: SocketAddr) -> RendezvousMessage {
         let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(&id).await {
             let mut old = old.write().await;
             let ip = socket_addr.ip();
@@ -601,7 +643,7 @@ impl RendezvousServer {
             request_pk,
             ..Default::default()
         });
-        socket.send(&msg_out, socket_addr).await
+        msg_out
     }
 
     #[inline]
@@ -818,6 +860,26 @@ impl RendezvousServer {
         });
     }
 
+    /// Envia ao aparelho: pelo link persistente se ele se registrou por TCP/WebSocket, senão por UDP.
+    async fn send_to_peer(&mut self, msg: RendezvousMessage, peer_addr: SocketAddr) {
+        if self.peer_links.lock().await.contains_key(&peer_addr) {
+            self.send_link(peer_addr, msg).await;
+        } else {
+            self.tx.send(Data::Msg(msg.into(), peer_addr)).ok();
+        }
+    }
+
+    async fn send_link(&mut self, addr: SocketAddr, msg: RendezvousMessage) {
+        let mut links = self.peer_links.lock().await;
+        if let Some(sk) = links.remove(&addr) {
+            let mut o = Some(sk);
+            Self::send_to_sink(&mut o, msg).await;
+            if let Some(sk) = o {
+                links.insert(addr, sk);
+            }
+        }
+    }
+
     #[inline]
     async fn send_to_sink(sink: &mut Option<Sink>, msg: RendezvousMessage) {
         if let Some(sink) = sink.as_mut() {
@@ -855,7 +917,7 @@ impl RendezvousServer {
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
         if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg.into(), addr))?;
+            self.send_to_peer(msg, addr).await;
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
@@ -1167,6 +1229,10 @@ impl RendezvousServer {
                 Ok(response)
             };
             let ws_stream = tokio_tungstenite::accept_hdr_async(stream, callback).await?;
+            if addr.port() == 0 {
+                // vários aparelhos atrás do mesmo proxy: porta sintética única por conexão
+                addr.set_port(next_link_port());
+            }
             let (a, mut b) = ws_stream.split();
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
@@ -1188,6 +1254,7 @@ impl RendezvousServer {
         if sink.is_none() {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         }
+        self.peer_links.lock().await.remove(&addr);
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
     }
@@ -1330,6 +1397,20 @@ async fn test_hbbs(addr: SocketAddr) -> ResultType<()> {
 }
 
 #[inline]
+fn rk_res(res: register_pk_response::Result) -> RendezvousMessage {
+    let mut msg_out = RendezvousMessage::new();
+    msg_out.set_register_pk_response(RegisterPkResponse {
+        result: res.into(),
+        ..Default::default()
+    });
+    msg_out
+}
+
+static LINK_PORT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn next_link_port() -> u16 {
+    (LINK_PORT.fetch_add(1, Ordering::Relaxed) % 64000 + 1024) as u16
+}
+
 async fn send_rk_res(
     socket: &mut FramedSocket,
     addr: SocketAddr,
