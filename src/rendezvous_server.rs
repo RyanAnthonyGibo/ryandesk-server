@@ -84,6 +84,7 @@ pub struct RendezvousServer {
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
     // RyanDesk server: links persistentes (TCP/WebSocket) dos aparelhos registrados sem UDP.
     peer_links: Arc<Mutex<HashMap<SocketAddr, Sink>>>,
+    link_ids: Arc<Mutex<HashMap<SocketAddr, String>>>,
     pm: PeerMap,
     tx: Sender,
     relay_servers: Arc<RelayServers>,
@@ -132,6 +133,7 @@ impl RendezvousServer {
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             peer_links: Arc::new(Mutex::new(HashMap::new())),
+            link_ids: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
@@ -146,6 +148,23 @@ impl RendezvousServer {
                 local_ip,
             }),
         };
+        {
+            // RyanDesk server: batimento nos links TCP/WebSocket (o cliente responde e fica online).
+            let links = rs.peer_links.clone();
+            tokio::spawn(async move {
+                let mut t = interval(Duration::from_secs(20));
+                loop {
+                    t.tick().await;
+                    let mut l = links.lock().await;
+                    for sk in l.values_mut() {
+                        match sk {
+                            Sink::TcpStream(x) => { allow_err!(x.send(Bytes::new()).await); }
+                            Sink::Ws(x) => { allow_err!(x.send(tungstenite::Message::Binary(Vec::new())).await); }
+                        }
+                    }
+                }
+            });
+        }
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
@@ -578,8 +597,22 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    let id = rk.id.clone();
                     match self.register_pk(rk, addr).await {
                         Ok(Some(msg_out)) => {
+                            let ok = msg_out.register_pk_response().result.enum_value()
+                                == Ok(register_pk_response::Result::OK);
+                            if ok {
+                                if let Some(sk) = sink.take() {
+                                    self.peer_links.lock().await.insert(addr, sk);
+                                }
+                                self.link_ids.lock().await.insert(addr, id.clone());
+                                self.touch_link(addr).await;
+                                let mut m = msg_out.clone();
+                                m.mut_register_pk_response().keep_alive = 60;
+                                self.send_link(addr, m).await;
+                                return true;
+                            }
                             if sink.is_some() {
                                 Self::send_to_sink(sink, msg_out).await;
                             } else {
@@ -866,6 +899,18 @@ impl RendezvousServer {
             self.send_link(peer_addr, msg).await;
         } else {
             self.tx.send(Data::Msg(msg.into(), peer_addr)).ok();
+        }
+    }
+
+    /// Mantém o aparelho online enquanto o link TCP/WebSocket estiver vivo.
+    async fn touch_link(&mut self, addr: SocketAddr) {
+        let id = self.link_ids.lock().await.get(&addr).cloned();
+        if let Some(id) = id {
+            if let Some(peer) = self.pm.get_in_memory(&id).await {
+                let mut w = peer.write().await;
+                w.socket_addr = addr;
+                w.last_reg_time = Instant::now();
+            }
         }
     }
 
@@ -1237,6 +1282,10 @@ impl RendezvousServer {
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
+                    if bytes.is_empty() {
+                        self.touch_link(addr).await;
+                        continue;
+                    }
                     if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                         break;
                     }
@@ -1246,6 +1295,10 @@ impl RendezvousServer {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
             sink = Some(Sink::TcpStream(a));
             while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+                if bytes.is_empty() {
+                    self.touch_link(addr).await;
+                    continue;
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
@@ -1255,6 +1308,7 @@ impl RendezvousServer {
             self.tcp_punch.lock().await.remove(&try_into_v4(addr));
         }
         self.peer_links.lock().await.remove(&addr);
+        self.link_ids.lock().await.remove(&addr);
         log::debug!("Tcp connection from {:?} closed", addr);
         Ok(())
     }
